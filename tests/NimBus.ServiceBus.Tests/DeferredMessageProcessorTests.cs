@@ -336,6 +336,60 @@ public class DeferredMessageProcessorTests
         Assert.AreEqual(ActivityStatusCode.Ok, span.Status);
     }
 
+    // ── Session blocked again mid-drain ─────────────────────────────────
+
+    [TestMethod]
+    public async Task ProcessDeferredMessagesAsync_FirstReplayBlocksSessionAgain_StopsAtTheReplayParkedAgain()
+    {
+        // A settled handoff unblocked the session, so this drain replays what was parked
+        // behind it. The first replay hands off again and blocks the session, so the
+        // endpoint parks the second replay again. Draining on would replay that copy,
+        // have it parked, and replay it again, about three times a second, until the new
+        // handoff settled.
+        using var runaway = new CancellationTokenSource();
+        using var capture = ReplayTelemetryCapture.Start();
+        var client = new RecordingServiceBusClient();
+        var parkedB = ParkOriginal("event-b", deferralSequence: 1);
+        var parkedC = ParkOriginal("event-c", deferralSequence: 2);
+        client.SessionReceiver.ReceiveBatches.Add(new List<ServiceBusReceivedMessage> { parkedB, parkedC });
+        var endpoint = new ReplayingEndpoint(client, runaway, blockedByEventId: null, nextDeferralSequence: 3);
+
+        await new DeferredMessageProcessor(client).ProcessDeferredMessagesAsync("session-1", "BillingEndpoint", runaway.Token);
+
+        CollectionAssert.AreEqual(new[] { "event-b", "event-c" }, ReplayedEventIds(client));
+        Assert.AreEqual("event-b", endpoint.BlockedByEventId);
+        CollectionAssert.AreEqual(new[] { parkedB, parkedC }, client.SessionReceiver.CompletedMessages);
+        Assert.AreEqual(1, endpoint.ParkedAgain.Count);
+        CollectionAssert.AreEqual(endpoint.ParkedAgain, client.SessionReceiver.AbandonedMessages,
+            "The copy parked again stays on the Deferred session for the next unblock.");
+
+        var span = capture.Activities.Single(a => a.OperationName == "NimBus.DeferredProcessor.Replay");
+        Assert.AreEqual(ActivityStatusCode.Ok, span.Status);
+        Assert.AreEqual(2, span.GetTagItem(MessagingAttributes.NimBusDeferredBatchSize));
+        Assert.AreEqual(2, capture.LongMeasurements.Where(m => m.Name == "nimbus.deferred.replayed").Sum(m => m.Value));
+    }
+
+    [TestMethod]
+    public async Task ProcessDeferredMessagesAsync_SessionBlockedThroughout_ReplaysEachParkedMessageOnce()
+    {
+        // The session stays blocked for the whole drain, so the endpoint parks every replay
+        // again and both copies come back in one receive. The drain stops at the first and
+        // leaves the rest of that batch parked, in order.
+        using var runaway = new CancellationTokenSource();
+        var client = new RecordingServiceBusClient();
+        var parkedB = ParkOriginal("event-b", deferralSequence: 1);
+        var parkedC = ParkOriginal("event-c", deferralSequence: 2);
+        client.SessionReceiver.ReceiveBatches.Add(new List<ServiceBusReceivedMessage> { parkedB, parkedC });
+        var endpoint = new ReplayingEndpoint(client, runaway, blockedByEventId: "event-a", nextDeferralSequence: 3);
+
+        await new DeferredMessageProcessor(client).ProcessDeferredMessagesAsync("session-1", "BillingEndpoint", runaway.Token);
+
+        CollectionAssert.AreEqual(new[] { "event-b", "event-c" }, ReplayedEventIds(client));
+        CollectionAssert.AreEqual(new[] { parkedB, parkedC }, client.SessionReceiver.CompletedMessages);
+        Assert.AreEqual(2, endpoint.ParkedAgain.Count);
+        CollectionAssert.AreEqual(endpoint.ParkedAgain, client.SessionReceiver.AbandonedMessages);
+    }
+
     // ── GetDeferralSequence behavior (tested via sort order) ────────────
 
     [TestMethod]
@@ -620,6 +674,126 @@ public class DeferredMessageProcessorTests
             body: new BinaryData("payload"),
             correlationId: correlationId,
             properties: properties);
+    }
+
+    private static string?[] ReplayedEventIds(RecordingServiceBusClient client) =>
+        client.Sender.SentMessages
+            .Select(message => message.ApplicationProperties[UserPropertyName.EventId.ToString()]?.ToString())
+            .ToArray();
+
+    // An original delivery parked behind the block, as StrictMessageHandler parks it.
+    private static ServiceBusReceivedMessage ParkOriginal(string eventId, int deferralSequence) =>
+        Park(
+            new InMemoryMessageContext(
+                new Message
+                {
+                    MessageId = $"delivery-{eventId}",
+                    EventId = eventId,
+                    SessionId = "session-1",
+                    To = "BillingEndpoint",
+                    From = "StorefrontEndpoint",
+                    OriginatingMessageId = Constants.Self,
+                    EventTypeId = "OrderPlaced",
+                    MessageType = MessageType.EventRequest,
+                    MessageContent = new MessageContent(),
+                },
+                new InMemorySessionState()),
+            deferralSequence);
+
+    // Parks through the production ResponseService and hands the copy back the way the
+    // Deferred subscription delivers it, with the MessageId Service Bus assigns.
+    private static ServiceBusReceivedMessage Park(IMessageContext context, int deferralSequence)
+    {
+        var parkingSender = new RecordingServiceBusSender();
+        new ResponseService(new Sender(parkingSender))
+            .SendToDeferredSubscription(context, deferralSequence)
+            .GetAwaiter()
+            .GetResult();
+        var parked = parkingSender.SentMessages.Single();
+        return ServiceBusModelFactory.ServiceBusReceivedMessage(
+            body: parked.Body,
+            messageId: parked.MessageId ?? Guid.NewGuid().ToString(),
+            sessionId: parked.SessionId,
+            correlationId: parked.CorrelationId,
+            properties: new Dictionary<string, object>(parked.ApplicationProperties));
+    }
+
+    /// <summary>
+    /// Plays the endpoint on the far side of each replay. With no block, the first replay
+    /// is handled and hands off, which blocks the session behind it. While the session is
+    /// blocked, the endpoint parks each replay again, as StrictMessageHandler does, and the
+    /// copy is receivable on the Deferred session straight away.
+    /// </summary>
+    private sealed class ReplayingEndpoint
+    {
+        // Without the stop rule the drain never ends in these scenarios. Cancel it
+        // rather than hang the test run.
+        private const int RunawayReplayLimit = 20;
+
+        private readonly RecordingServiceBusClient _client;
+        private readonly CancellationTokenSource _runaway;
+        private int _nextDeferralSequence;
+
+        public ReplayingEndpoint(
+            RecordingServiceBusClient client,
+            CancellationTokenSource runaway,
+            string? blockedByEventId,
+            int nextDeferralSequence)
+        {
+            _client = client;
+            _runaway = runaway;
+            BlockedByEventId = blockedByEventId;
+            _nextDeferralSequence = nextDeferralSequence;
+            client.Sender.OnSent = OnReplay;
+        }
+
+        public string? BlockedByEventId { get; private set; }
+
+        public List<ServiceBusReceivedMessage> ParkedAgain { get; } = new();
+
+        private void OnReplay(Azure.Messaging.ServiceBus.ServiceBusMessage replay)
+        {
+            if (_client.Sender.SentMessages.Count >= RunawayReplayLimit)
+            {
+                _runaway.Cancel();
+                return;
+            }
+
+            var delivered = AsDelivered(replay);
+            if (BlockedByEventId is null)
+            {
+                BlockedByEventId = delivered.EventId;
+                return;
+            }
+
+            var parkedAgain = Park(delivered, _nextDeferralSequence++);
+            ParkedAgain.Add(parkedAgain);
+            _client.SessionReceiver.Available.Add(parkedAgain);
+        }
+
+        private static InMemoryMessageContext AsDelivered(Azure.Messaging.ServiceBus.ServiceBusMessage replay)
+        {
+            string? Property(UserPropertyName name) =>
+                replay.ApplicationProperties.TryGetValue(name.ToString(), out var value) ? value?.ToString() : null;
+
+            return new InMemoryMessageContext(
+                new Message
+                {
+                    // Service Bus assigns a MessageId when the sender left it unset.
+                    MessageId = replay.MessageId ?? Guid.NewGuid().ToString(),
+                    EventId = Property(UserPropertyName.EventId)!,
+                    SessionId = replay.SessionId,
+                    CorrelationId = replay.CorrelationId,
+                    To = Property(UserPropertyName.To)!,
+                    From = Property(UserPropertyName.From)!,
+                    OriginatingMessageId = Property(UserPropertyName.OriginatingMessageId) ?? Constants.Self,
+                    ParentMessageId = Property(UserPropertyName.ParentMessageId)!,
+                    EventTypeId = Property(UserPropertyName.EventTypeId)!,
+                    MessageType = MessageType.EventRequest,
+                    MessageContent = new MessageContent(),
+                },
+                new InMemorySessionState());
+        }
     }
 
     private sealed class ReplayTelemetryCapture : IDisposable

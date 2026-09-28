@@ -163,13 +163,23 @@ When the failed event is resolved (resubmit, retry, or skip succeeds):
 `DeferredMessageProcessor.ProcessDeferredMessagesAsync()` (`src/NimBus.ServiceBus/DeferredMessageProcessor.cs`):
 
 1. Accepts the session from the deferred subscription (`AcceptSessionAsync`)
-2. Receives messages in batches (up to 100)
+2. Receives messages in batches (up to 100) until a receive comes back empty
 3. **Sorts by `DeferralSequence`** to maintain FIFO order
-4. Re-publishes each to the main topic with the original `SessionId`
+4. Re-publishes each to the main topic with the original `SessionId` and a new `MessageId`
 5. Completes deferred messages from the subscription
-6. `ResetDeferredCount()` sets count back to 0
 
 Re-published messages then flow through normal processing in their original order.
+
+A replay can block the session again, either by failing or by handing off
+(`PendingHandoff`). The endpoint then parks every later replay, and each parked copy
+carries the replay's `MessageId` as its `ParentMessageId`. When the drain receives such a
+copy, it stops. It abandons that copy and the rest of the batch, so they stay parked in
+order. Without this stop, the drain would receive its own replays straight back and
+replay them several times a second until the block cleared.
+
+Nothing resets `DeferredCount`, so every later unblock of the session sends another
+`ProcessDeferredRequest`, and the next drain picks up whatever is still parked. A drain
+that finds nothing parked does nothing.
 
 ## A tracking row is Deferred but the broker message is missing
 
@@ -236,7 +246,8 @@ The deferred message flow is covered by dedicated tests:
 | Deferred count tracking | `HandleEventRequest_WhenSessionBlocked_IncrementsDeferredCount` |
 | Unblocking | `HandleSkipRequest_WhenSessionIsBlockedByThis_UnblocksSession` |
 | Legacy continuation | `HandleContinuationRequest_CompletesLegacyRequestWithoutProcessing` |
-| Modern batch processing | `HandleProcessDeferredRequest_WhenCalled_ProcessesDeferredAndResetsCount` |
+| Deferred drain | `ProcessDeferredMessagesAsync_PartialBatches_DrainsRemainingMessages` |
+| Drain stops when the session blocks again | `ProcessDeferredMessagesAsync_FirstReplayBlocksSessionAgain_StopsAtTheReplayParkedAgain` |
 | Recovery triggers | `HandleResubmissionRequest_WhenSucceedsAndDeferredCountGtZero_SendsProcessDeferredRequest` |
 
 Additional tests exist in `tests/NimBus.ServiceBus.Tests/` for session state serialization and deferred message operations. End-to-end tests in `tests/NimBus.EndToEnd.Tests/` verify the complete deferral workflow including retry backoff, resubmission, and metadata integrity.

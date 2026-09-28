@@ -29,6 +29,9 @@ public class DeferredMessageProcessor : IDeferredMessageProcessor
     /// Processes all deferred messages for the specified session.
     /// Messages are retrieved from the session-enabled deferred subscription using AcceptSessionAsync,
     /// sorted by DeferralSequence, and re-published to the main topic for normal processing.
+    /// The drain stops early when the endpoint parks one of its replays again, because the
+    /// session is blocked again; that copy and everything after it stay parked for the next
+    /// unblock.
     /// </summary>
     public async Task ProcessDeferredMessagesAsync(string sessionId, string topicName, CancellationToken cancellationToken = default)
     {
@@ -67,8 +70,13 @@ public class DeferredMessageProcessor : IDeferredMessageProcessor
             {
                 try
                 {
+                    // MessageIds of this drain's replays. A parked message whose ParentMessageId
+                    // is one of them is a replay the endpoint parked again.
+                    var replayedMessageIds = new HashSet<string>(StringComparer.Ordinal);
+                    var sessionBlockedAgain = false;
+
                     // Receive messages in batches until we've processed all messages for this session
-                    while (!cancellationToken.IsCancellationRequested)
+                    while (!sessionBlockedAgain && !cancellationToken.IsCancellationRequested)
                     {
                         var messages = await receiver.ReceiveMessagesAsync(BatchSize, TimeSpan.FromSeconds(5), cancellationToken);
                         if (messages == null || messages.Count == 0)
@@ -78,24 +86,44 @@ public class DeferredMessageProcessor : IDeferredMessageProcessor
                         var orderedMessages = messages.OrderBy(m => GetDeferralSequence(m)).ToList();
 
                         var batchTimestamp = Stopwatch.GetTimestamp();
+                        var batchReplayed = 0;
 
-                        foreach (var message in orderedMessages)
+                        for (var i = 0; i < orderedMessages.Count; i++)
                         {
                             cancellationToken.ThrowIfCancellationRequested();
+                            var message = orderedMessages[i];
+
+                            if (IsReplayParkedAgain(message, replayedMessageIds))
+                            {
+                                // A replay failed or handed off, so the session is blocked again and
+                                // the endpoint parks every later replay straight back here. Draining
+                                // on would replay the same messages in a tight loop until the block
+                                // clears. Leave this copy and everything after it for the next unblock.
+                                for (var j = i; j < orderedMessages.Count; j++)
+                                    await receiver.AbandonMessageAsync(orderedMessages[j], cancellationToken: cancellationToken);
+
+                                sessionBlockedAgain = true;
+                                break;
+                            }
 
                             // Re-publish to main topic for normal processing
                             var republishedMessage = CreateRepublishedMessage(message, sessionId, topicName);
+                            replayedMessageIds.Add(republishedMessage.MessageId);
                             await sender.SendMessageAsync(republishedMessage, cancellationToken);
 
                             // Complete the deferred message
                             await receiver.CompleteMessageAsync(message, cancellationToken);
+                            batchReplayed++;
                         }
 
-                        var batchElapsedMs = Stopwatch.GetElapsedTime(batchTimestamp).TotalMilliseconds;
-                        var endpointTag = BuildEndpointTag(topicName);
-                        NimBusMeters.DeferredReplayed.Add(orderedMessages.Count, endpointTag);
-                        NimBusMeters.DeferredReplayDuration.Record(batchElapsedMs, endpointTag);
-                        totalReplayed += orderedMessages.Count;
+                        if (batchReplayed > 0)
+                        {
+                            var batchElapsedMs = Stopwatch.GetElapsedTime(batchTimestamp).TotalMilliseconds;
+                            var endpointTag = BuildEndpointTag(topicName);
+                            NimBusMeters.DeferredReplayed.Add(batchReplayed, endpointTag);
+                            NimBusMeters.DeferredReplayDuration.Record(batchElapsedMs, endpointTag);
+                            totalReplayed += batchReplayed;
+                        }
 
                         // A short receive does not mean the session is drained: the SDK
                         // can return a partial batch while more messages are available.
@@ -137,9 +165,21 @@ public class DeferredMessageProcessor : IDeferredMessageProcessor
         return 0;
     }
 
+    // Only a replay the endpoint parked again carries one of this drain's replay ids: the
+    // endpoint stamps the id of the delivery it parks as the parked copy's ParentMessageId.
+    private static bool IsReplayParkedAgain(ServiceBusReceivedMessage message, HashSet<string> replayedMessageIds) =>
+        message.ApplicationProperties.TryGetValue(UserPropertyName.ParentMessageId.ToString(), out var parentMessageId)
+        && parentMessageId?.ToString() is { } id
+        && replayedMessageIds.Contains(id);
+
     private static Azure.Messaging.ServiceBus.ServiceBusMessage CreateRepublishedMessage(ServiceBusReceivedMessage deferredMessage, string sessionId, string topicName)
     {
-        var result = new Azure.Messaging.ServiceBus.ServiceBusMessage(deferredMessage.Body);
+        var result = new Azure.Messaging.ServiceBus.ServiceBusMessage(deferredMessage.Body)
+        {
+            // Our own id instead of the broker's, so the drain can recognise this replay if
+            // the endpoint parks it again (see IsReplayParkedAgain).
+            MessageId = Guid.NewGuid().ToString(),
+        };
 
         // Copy all application properties except the deferred-specific ones.
         // We also drop "To" because the inbound deferred message's To is "Deferred"

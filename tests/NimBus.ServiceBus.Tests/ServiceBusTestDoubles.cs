@@ -128,7 +128,15 @@ internal sealed class RecordingServiceBusSessionReceiver : ServiceBusSessionRece
     // Batch-receive support for DeferredMessageProcessor tests
     public List<IReadOnlyList<ServiceBusReceivedMessage>> ReceiveBatches { get; set; } = new();
     private int _receiveBatchIndex;
+
+    /// <summary>
+    /// Messages that become receivable while a test runs, such as a replay the endpoint
+    /// parks again mid-drain. Once the configured batches are used up, a receive returns
+    /// what is available, like Service Bus does.
+    /// </summary>
+    public List<ServiceBusReceivedMessage> Available { get; } = new();
     public List<ServiceBusReceivedMessage> CompletedMessages { get; } = new();
+    public List<ServiceBusReceivedMessage> AbandonedMessages { get; } = new();
     public Exception? ReceiveMessagesException { get; set; }
 
     public override Task<IReadOnlyList<ServiceBusReceivedMessage>> ReceiveDeferredMessagesAsync(IEnumerable<long> sequenceNumbers, CancellationToken cancellationToken = default)
@@ -143,12 +151,27 @@ internal sealed class RecordingServiceBusSessionReceiver : ServiceBusSessionRece
             throw ReceiveMessagesException;
         if (_receiveBatchIndex < ReceiveBatches.Count)
             return Task.FromResult(ReceiveBatches[_receiveBatchIndex++]);
+        if (Available.Count > 0)
+        {
+            var batch = Available.Take(maxMessages).ToList();
+            Available.RemoveRange(0, batch.Count);
+            return Task.FromResult<IReadOnlyList<ServiceBusReceivedMessage>>(batch);
+        }
         return Task.FromResult<IReadOnlyList<ServiceBusReceivedMessage>>(Array.Empty<ServiceBusReceivedMessage>());
     }
 
     public override Task CompleteMessageAsync(ServiceBusReceivedMessage message, CancellationToken cancellationToken = default)
     {
         CompletedMessages.Add(message);
+        return Task.CompletedTask;
+    }
+
+    public override Task AbandonMessageAsync(
+        ServiceBusReceivedMessage message,
+        IDictionary<string, object>? propertiesToModify = null,
+        CancellationToken cancellationToken = default)
+    {
+        AbandonedMessages.Add(message);
         return Task.CompletedTask;
     }
 
