@@ -1,6 +1,6 @@
 import * as React from "react";
 import * as api from "api-client";
-import { Link } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import Page from "components/page";
 import DataTable, {
   ITableBodyAction,
@@ -13,16 +13,26 @@ import TruncatedGuid from "components/common/truncated-guid";
 import { Badge } from "components/ui/badge";
 import { Checkbox } from "components/ui/checkbox";
 import { EmptyState } from "components/ui/empty-state";
-import { StatRow, StatTile } from "components/ui/stat-tile";
+import { Select } from "components/ui/select";
 import FailedHistogram from "components/failed-messages/failed-histogram";
-import FailedFilterBar from "components/failed-messages/failed-filter-bar";
+import FailedFilterPills, {
+  FailedSearchBox,
+} from "components/failed-messages/failed-filter-pills";
+import FailedLegend from "components/failed-messages/failed-legend";
+import FailedItemList, {
+  failureIdOf,
+  failureRouteOf,
+  type FailureAction,
+} from "components/failed-messages/failed-item-list";
+import FailureDetailPanel from "components/failed-messages/failure-detail-panel";
+import { SidePanel } from "components/ui/side-panel";
 import FailedErrorGroupsView from "components/failed-messages/failed-error-groups";
 import { useUrlFilters } from "hooks/use-url-filters";
 import { formatMoment } from "functions/endpoint.functions";
 import { notifyError, notifySuccess } from "functions/notifications.functions";
+import moment from "moment";
 import {
   EMPTY_FAILED_FILTER,
-  PERIOD_OPTIONS,
   SEARCH_FIELDS,
   deferredCountsBySession,
   errorTextOf,
@@ -30,8 +40,10 @@ import {
   formatBucket,
   periodOption,
   resolveWindow,
-  selectedBucketWindow,
+  selectedWindow,
   toFailedSearchFilter,
+  toggleStatus,
+  windowParams,
   type FailedFilterValues,
 } from "functions/failed-messages.functions";
 import { cn } from "lib/utils";
@@ -122,6 +134,10 @@ export default function FailedMessages() {
   const [blocked, setBlocked] = React.useState<Record<string, number>>({});
   const [backlog, setBacklog] = React.useState<number>();
   const [hideReported, setHideReported] = React.useState(false);
+  // Checked items in the item view (the table keeps its own selection).
+  const [selected, setSelected] = React.useState<Set<string>>(
+    () => new Set(),
+  );
   const [hiddenColumns, setHiddenColumns] =
     React.useState<Set<string>>(loadHiddenColumns);
   const headCells = React.useMemo(
@@ -147,9 +163,11 @@ export default function FailedMessages() {
   const ticket = React.useRef(0);
 
   const key = searchKey(applied);
+  // Changes to the brushed window (or a legacy bar link) reload the list, not the chart.
+  const windowKey = `${applied.bucket}|${applied.windowStart}|${applied.windowEnd}`;
   const windowFor = React.useCallback(
     (values: FailedFilterValues) =>
-      selectedBucketWindow(values) ?? resolveWindow(values.period, new Date()),
+      selectedWindow(values) ?? resolveWindow(values.period, new Date()),
     [],
   );
 
@@ -238,7 +256,10 @@ export default function FailedMessages() {
         if (current !== ticket.current) return;
         const rows = response.events ?? [];
         setEvents((prev) => (append ? [...prev, ...rows] : rows));
-        if (!append) setBlocked({});
+        if (!append) {
+          setBlocked({});
+          setSelected(new Set());
+        }
         setContinuationToken(response.continuationToken ?? undefined);
         void loadBlocked(rows, current);
       } catch (e) {
@@ -251,7 +272,7 @@ export default function FailedMessages() {
       }
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [key, applied.bucket, client, loadBlocked, windowFor],
+    [key, windowKey, client, loadBlocked, windowFor],
   );
 
   // List: the range (or the selected bar).
@@ -277,7 +298,7 @@ export default function FailedMessages() {
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [view, key, applied.bucket, refresh, client, windowFor]);
+  }, [view, key, windowKey, refresh, client, windowFor]);
 
   const act = React.useCallback(
     (
@@ -288,6 +309,7 @@ export default function FailedMessages() {
       if (valid.length === 0) return;
       const ids = new Set(valid.map((t) => t.eventId));
       setEvents((prev) => prev.filter((e) => !ids.has(e.eventId)));
+      setSelected(new Set());
       Promise.allSettled(
         valid.map((t) =>
           action === "Resubmit"
@@ -336,7 +358,7 @@ export default function FailedMessages() {
       const ids = new Set(selected.map((r) => r.id));
       act(
         name as "Resubmit" | "Skip",
-        events.filter((e) => ids.has(`${e.endpointId}/${e.eventId}`)),
+        events.filter((e) => ids.has(failureIdOf(e))),
       );
       return false;
     },
@@ -344,14 +366,92 @@ export default function FailedMessages() {
 
   const narrow = (patch: Partial<FailedFilterValues>) =>
     applyFilters({ ...applied, ...patch });
+  // A search that changes nothing still reloads, so an operator can re-run it to see new
+  // failures; a changed filter reloads through the URL on its own.
+  const search = (patch: Partial<FailedFilterValues>) => {
+    if (searchKey({ ...applied, ...patch }) === key) setRefresh((n) => n + 1);
+    else narrow(patch);
+  };
 
   const visible = hideReported ? events.filter((e) => !e.isReported) : events;
+
+  // The details panel is `?open=<endpointId>/<eventId>`, outside the filter values so the
+  // sessionStorage mirror never reopens it. Opening adds a history entry, so Back closes it.
+  const [searchParams, setSearchParams] = useSearchParams();
+  const openId = searchParams.get("open") ?? undefined;
+  const openTarget = React.useMemo(() => {
+    const slash = openId?.indexOf("/") ?? -1;
+    return openId && slash > 0
+      ? { endpointId: openId.slice(0, slash), eventId: openId.slice(slash + 1) }
+      : undefined;
+  }, [openId]);
+  const setOpen = React.useCallback(
+    (id: string | undefined, replace = false) =>
+      setSearchParams(
+        (prev) => {
+          const next = new URLSearchParams(prev);
+          if (id) next.set("open", id);
+          else next.delete("open");
+          return next;
+        },
+        { replace },
+      ),
+    [setSearchParams],
+  );
+  const openIndex = openId
+    ? visible.findIndex((e) => failureIdOf(e) === openId)
+    : -1;
+  // "Next" on the last loaded failure loads the next page first, then moves on.
+  const pendingNext = React.useRef<string>(undefined);
+  React.useEffect(() => {
+    const from = pendingNext.current;
+    if (!from || listLoading) return;
+    pendingNext.current = undefined;
+    const i = visible.findIndex((e) => failureIdOf(e) === from);
+    if (i >= 0 && i + 1 < visible.length)
+      setOpen(failureIdOf(visible[i + 1]), true);
+  }, [visible, listLoading, setOpen]);
+  const onNextFailure =
+    openIndex < 0
+      ? undefined
+      : openIndex + 1 < visible.length
+        ? () => setOpen(failureIdOf(visible[openIndex + 1]), true)
+        : continuationToken
+          ? () => {
+              pendingNext.current = openId;
+              void fetchPage(continuationToken, true);
+            }
+          : undefined;
+  const onPreviousFailure =
+    openIndex > 0
+      ? () => setOpen(failureIdOf(visible[openIndex - 1]), true)
+      : undefined;
+  const actFromPanel = (action: FailureAction, e: api.Event) => {
+    // Move on to the neighbour before the list drops this failure.
+    const neighbour = visible[openIndex + 1] ?? visible[openIndex - 1];
+    act(action, [e]);
+    setOpen(
+      neighbour && failureIdOf(neighbour) !== failureIdOf(e)
+        ? failureIdOf(neighbour)
+        : undefined,
+      true,
+    );
+  };
+  const showSimilar = (e: api.Event) =>
+    setSearchParams((prev) => {
+      const next = new URLSearchParams(prev);
+      next.delete("open");
+      next.set("view", "error");
+      next.delete("endpointId");
+      if (e.endpointId) next.append("endpointId", e.endpointId);
+      return next;
+    });
   const rows: ITableRow[] = visible.map((e) => {
     const blockedCount = blocked[`${e.endpointId}/${e.sessionId}`] ?? 0;
     const error = errorTextOf(e);
     return {
-      id: `${e.endpointId}/${e.eventId}`,
-      route: `/Message/Index/${e.endpointId}/${e.eventId}/0`,
+      id: failureIdOf(e),
+      route: failureRouteOf(e),
       bodyActions: bodyActions(e),
       tone: e.isReported ? "reported" : undefined,
       data: new Map([
@@ -483,8 +583,7 @@ export default function FailedMessages() {
     (totals?.deadLettered ?? 0) +
     (totals?.unsupported ?? 0);
   const option = periodOption(applied.period);
-  const selectedWindow = selectedBucketWindow(applied);
-  const loadingTile = histogramLoading && !histogram;
+  const listWindow = selectedWindow(applied);
   const peak = (histogram?.buckets ?? []).reduce<
     api.FailedHistogramBucket | undefined
   >((best, b) => {
@@ -501,14 +600,13 @@ export default function FailedMessages() {
   );
   const outsideRange =
     backlog !== undefined && unfiltered ? Math.max(0, backlog - inRange) : 0;
+  const stamp = (m: moment.Moment | Date | undefined) =>
+    m ? moment(m).format("DD/MM/YYYY, HH:mm") : "…";
 
-  const segBtn = (active: boolean) =>
-    cn(
-      "px-3 py-1.5 rounded-md text-xs font-semibold transition-colors",
-      active
-        ? "bg-primary text-white"
-        : "text-muted-foreground hover:text-foreground",
-    );
+  const tabClass = (active: boolean) =>
+    active
+      ? "h-10 border-b-[3px] border-primary px-3 text-[17px] font-semibold text-foreground"
+      : "mb-1 h-8 rounded-[2px] border border-foreground px-4 text-[14px] text-foreground hover:bg-muted";
 
   return (
     <Page
@@ -516,23 +614,55 @@ export default function FailedMessages() {
       subtitle="Unresolved failures across every endpoint you can read"
     >
       <div className="flex w-full flex-col gap-4">
-        <div className="flex flex-wrap items-center gap-2">
-          <div
-            className="inline-flex items-center gap-[2px] rounded-nb-md border border-border bg-card p-[3px]"
-            role="group"
-            aria-label="Time range"
-          >
-            {PERIOD_OPTIONS.map((p) => (
-              <button
-                key={p.value}
-                type="button"
-                className={segBtn(option.value === p.value)}
-                aria-pressed={option.value === p.value}
-                onClick={() => narrow({ period: p.value, bucket: "" })}
-              >
-                {p.label}
-              </button>
-            ))}
+        <FailedFilterPills
+          value={applied}
+          statusCounts={
+            totals
+              ? {
+                  Failed: totals.failed,
+                  DeadLettered: totals.deadLettered,
+                  Unsupported: totals.unsupported,
+                }
+              : undefined
+          }
+          onApply={search}
+          onReset={resetFilters}
+        />
+        <FailedSearchBox
+          value={applied}
+          onApply={search}
+        />
+
+        <section
+          aria-label="Failures over time"
+          className="flex flex-col gap-2.5 rounded-lg border border-border bg-card px-5 pb-4 pt-4"
+        >
+          <div className="flex flex-wrap items-end justify-between gap-3 border-b border-border pb-2.5">
+            <div className="flex flex-wrap items-baseline gap-2">
+              <span className="text-[38px] font-medium leading-none tracking-tight">
+                {histogramLoading && !histogram
+                  ? "—"
+                  : inRange.toLocaleString()}
+              </span>
+              <span className="text-sm text-muted-foreground">
+                unresolved failure{inRange === 1 ? "" : "s"} between{" "}
+                <b className="text-foreground">{stamp(histogram?.from)}</b> and{" "}
+                <b className="text-foreground">{stamp(histogram?.to)}</b>
+              </span>
+            </div>
+            <label className="flex items-center gap-2 text-[13.5px]">
+              Group by:
+              <Select
+                aria-label="Group chart by"
+                value={split}
+                onChange={(e) => narrow({ split: e.target.value })}
+                options={[
+                  { value: "status", label: "Status" },
+                  { value: "endpoint", label: "Endpoint" },
+                ]}
+                className="h-8 w-[150px] py-0"
+              />
+            </label>
           </div>
           {outsideRange > 0 && (
             <span className="text-[13px] text-muted-foreground">
@@ -545,7 +675,10 @@ export default function FailedMessages() {
                     type="button"
                     className="font-semibold text-primary-700 hover:underline"
                     onClick={() =>
-                      narrow({ period: api.Period._30d, bucket: "" })
+                      narrow({
+                        period: api.Period._30d,
+                        ...windowParams(undefined),
+                      })
                     }
                   >
                     show 30d
@@ -554,108 +687,26 @@ export default function FailedMessages() {
               )}
             </span>
           )}
-        </div>
-
-        <StatRow columns={5}>
-          <StatTile
-            label="Total"
-            value={loadingTile ? "—" : inRange.toLocaleString()}
-            tone={inRange > 0 ? "danger" : "muted"}
-            delta={`last ${option.label}`}
-          />
-          <StatTile
-            label="Failed"
-            value={loadingTile ? "—" : (totals?.failed ?? 0).toLocaleString()}
-            tone={(totals?.failed ?? 0) > 0 ? "danger" : "muted"}
-            delta="handler threw"
-          />
-          <StatTile
-            label="DeadLettered"
-            value={
-              loadingTile ? "—" : (totals?.deadLettered ?? 0).toLocaleString()
-            }
-            tone={(totals?.deadLettered ?? 0) > 0 ? "danger" : "muted"}
-            delta="max deliveries hit"
-          />
-          <StatTile
-            label="Unsupported"
-            value={
-              loadingTile ? "—" : (totals?.unsupported ?? 0).toLocaleString()
-            }
-            tone="muted"
-            delta="no handler"
-          />
-          <StatTile
-            label="Endpoints affected"
-            value={
-              loadingTile
-                ? "—"
-                : (totals?.byEndpoint?.length ?? 0).toLocaleString()
-            }
-            tone="muted"
-            delta={
-              peak
-                ? `peak ${formatBucket(peak.start, histogram?.bucketMinutes ?? 60, true)}`
-                : "no failures"
-            }
-          />
-        </StatRow>
-
-        <section
-          aria-label="Failures over time"
-          className="rounded-lg border border-border bg-card p-4"
-        >
-          <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
-            <div className="flex items-baseline gap-3">
-              <h2 className="m-0 text-[15px] font-bold">Failures over time</h2>
-              <span className="font-mono text-[12px] text-muted-foreground">
-                {option.bucketMinutes >= 1440
-                  ? "daily"
-                  : option.bucketMinutes >= 60
-                    ? `${option.bucketMinutes / 60}-hour`
-                    : `${option.bucketMinutes}-minute`}{" "}
-                buckets · by time of last failure
-              </span>
-            </div>
-            <div
-              className="inline-flex items-center gap-[2px] rounded-nb-md border border-border bg-card p-[3px]"
-              role="group"
-              aria-label="Chart split"
-            >
-              <button
-                type="button"
-                className={segBtn(split === "status")}
-                onClick={() => narrow({ split: "status" })}
-              >
-                By status
-              </button>
-              <button
-                type="button"
-                className={segBtn(split === "endpoint")}
-                onClick={() => narrow({ split: "endpoint" })}
-              >
-                By endpoint
-              </button>
-            </div>
-          </div>
           <FailedHistogram
             histogram={histogram}
             split={split}
-            selectedBucket={applied.bucket}
-            onSelectBucket={(bucket) => narrow({ bucket })}
+            window={listWindow}
+            onWindowChange={(w) => narrow(windowParams(w))}
             isLoading={histogramLoading}
           />
-          <div className="mt-2 flex flex-wrap items-center justify-between gap-2 text-[12.5px] text-muted-foreground">
-            <span>Click a bar to narrow the list to that window.</span>
-            {selectedWindow && (
+          <div className="flex flex-wrap items-center justify-between gap-2 text-[12.5px] text-muted-foreground">
+            <span>
+              Drag the handles, or click a bar, to narrow the list to a window.
+            </span>
+            {listWindow && (
               <span className="inline-flex items-center gap-1 rounded-full bg-primary-50 px-3 py-1 font-semibold text-primary-700">
-                Window{" "}
-                {formatBucket(selectedWindow.from, option.bucketMinutes, true)}
+                List window {moment(listWindow.from).format("DD/MM HH:mm")}–
+                {moment(listWindow.to).format("DD/MM HH:mm")}
                 <button
                   type="button"
                   aria-label="Clear time window"
                   className="px-1 text-[15px]"
-                  onClick={() => narrow({ bucket: "" })}
+                  onClick={() => narrow(windowParams(undefined))}
                 >
                   ×
                 </button>
@@ -663,65 +714,53 @@ export default function FailedMessages() {
             )}
           </div>
           {histogram?.truncated && (
-            <p className="mt-1 text-[12.5px] text-status-warning-ink">
+            <p className="m-0 text-[12.5px] text-status-warning-ink">
               The chart stopped counting at the store&apos;s cap; counts are a
               lower bound.
             </p>
           )}
+          <FailedLegend
+            totals={totals}
+            status={applied.status}
+            onToggleStatus={(s) => {
+              narrow({ status: toggleStatus(applied.status, s) });
+            }}
+            endpointsHint={
+              peak
+                ? `peak ${formatBucket(peak.start, histogram?.bucketMinutes ?? 60, true)}`
+                : "no failures"
+            }
+            isLoading={histogramLoading}
+          />
         </section>
 
-        <FailedFilterBar
-          value={applied}
-          statusCounts={
-            totals
-              ? {
-                  Failed: totals.failed,
-                  DeadLettered: totals.deadLettered,
-                  Unsupported: totals.unsupported,
-                }
-              : undefined
-          }
-          onSearch={(next) => {
-            applyFilters({ ...next, bucket: applied.bucket });
-            setRefresh((n) => n + 1);
-          }}
-          onReset={resetFilters}
-          isLoading={listLoading || groupsLoading}
-        />
-
-        <div className="flex flex-wrap items-center gap-2 text-sm">
-          <span className="text-[13px] font-semibold text-muted-foreground">
-            View:
-          </span>
+        <div className="mt-1 flex flex-wrap items-end justify-between gap-3">
           <div
-            className="inline-flex items-center gap-[2px] rounded-nb-md border border-border bg-card p-[3px]"
-            role="group"
+            role="tablist"
             aria-label="View"
+            className="flex flex-wrap items-end gap-3"
           >
-            <button
-              type="button"
-              className={segBtn(view === "list")}
-              onClick={() => narrow({ view: "list" })}
-            >
-              List
-            </button>
-            <button
-              type="button"
-              className={segBtn(view === "endpoint")}
-              onClick={() => narrow({ view: "endpoint" })}
-            >
-              By endpoint
-            </button>
-            <button
-              type="button"
-              className={segBtn(view === "error")}
-              onClick={() => narrow({ view: "error" })}
-            >
-              By error
-            </button>
+            {(
+              [
+                ["list", "Failures"],
+                ["endpoint", "Group by endpoint"],
+                ["error", "Group by error"],
+              ] as const
+            ).map(([key, label]) => (
+              <button
+                key={key}
+                type="button"
+                role="tab"
+                aria-selected={view === key}
+                className={tabClass(view === key)}
+                onClick={() => narrow({ view: key })}
+              >
+                {label}
+              </button>
+            ))}
           </div>
           {view === "list" && (
-            <div className="ml-auto flex items-center gap-3">
+            <div className="flex flex-wrap items-center gap-4 pb-1 text-[13.5px]">
               <label className="inline-flex cursor-pointer select-none items-center gap-2 text-muted-foreground">
                 <Checkbox
                   checked={hideReported}
@@ -730,12 +769,18 @@ export default function FailedMessages() {
                 />
                 Hide reported
               </label>
-              <ColumnChooser
-                columns={COLUMNS}
-                hidden={hiddenColumns}
-                onToggle={toggleColumn}
-                onReset={resetColumns}
-              />
+              {applied.display === "table" && (
+                <ColumnChooser
+                  columns={COLUMNS}
+                  hidden={hiddenColumns}
+                  onToggle={toggleColumn}
+                  onReset={resetColumns}
+                />
+              )}
+              <span className="text-muted-foreground">
+                <b className="text-foreground">Sort:</b> newest first (by last
+                failure)
+              </span>
             </div>
           )}
         </div>
@@ -767,6 +812,23 @@ export default function FailedMessages() {
             title="No failures match"
             description="No unresolved failures match these filters in this window. Try a wider range or fewer filters."
           />
+        ) : applied.display !== "table" ? (
+          <FailedItemList
+            events={visible}
+            blocked={blocked}
+            selected={selected}
+            onSelectedChange={setSelected}
+            onAct={act}
+            onOpen={(e) => setOpen(failureIdOf(e))}
+            openId={openId}
+            onNarrow={(field, value) => narrow({ [field]: value })}
+            hasMore={!!continuationToken}
+            isLoading={listLoading}
+            onLoadMore={() => {
+              if (continuationToken && !listLoading)
+                void fetchPage(continuationToken, true);
+            }}
+          />
         ) : (
           <DataTable
             headCells={headCells}
@@ -788,6 +850,33 @@ export default function FailedMessages() {
           />
         )}
       </div>
+      <SidePanel
+        isOpen={!!openTarget}
+        onClose={() => setOpen(undefined)}
+        label="Transaction details"
+      >
+        {openTarget && (
+          <FailureDetailPanel
+            key={openId}
+            endpointId={openTarget.endpointId}
+            eventId={openTarget.eventId}
+            position={
+              openIndex >= 0
+                ? {
+                    index: openIndex + 1,
+                    total: visible.length,
+                    more: !!continuationToken,
+                  }
+                : undefined
+            }
+            onPrevious={onPreviousFailure}
+            onNext={onNextFailure}
+            onClose={() => setOpen(undefined)}
+            onAct={actFromPanel}
+            onShowSimilar={showSimilar}
+          />
+        )}
+      </SidePanel>
     </Page>
   );
 }
