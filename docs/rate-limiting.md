@@ -47,6 +47,7 @@ quote:
 | `nimbus-login` | ≤ 50 per address | ≤ 100 | 600/hour per address |
 | `nimbus-intelligence` | ≤ 10 per user | ≤ 20 | 600/hour per user |
 | `nimbus-mcp` | ≤ 60 per caller and client | ≤ 120 | 3,600/hour per caller and client |
+| MCP changes (`McpMutations`) | ≤ 5 per caller and client | ≤ 10 | 300/hour per caller and client |
 
 **A caller pacing at or below the sustained rate is never rejected**, and
 therefore never logged. These policies are rate ceilings, not intrusion
