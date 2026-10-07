@@ -6,7 +6,9 @@ a read-only pilot in a nonproduction Azure environment, passed on 2026-10-06; se
 complete. It shipped in v4.5.0 (2026-10-06), its stale-state and UI-vs-agent race tests pass, and
 its delegated pilot in a nonproduction Azure environment passed on 2026-10-06; see the
 [Phase 2a plan](../../plan/2026-10-06-mcp-operator-phase2a-plan.md).
-Phases 2b and 3 have not started. Design: rev 2, 2026-09-25.
+Phases 2b and 3 have not started. Design: rev 2, 2026-09-25. Site Owners manage MCP access
+from the WebApp (turn it off, switch tools off, restrict people, clients and endpoints) per
+[Spec 037](../037-mcp-admin-access/spec.md).
 
 The interactive design is in [design.html](design.html). It covers the architecture, the 21-tool
 catalog, a recovery walkthrough, the security model, delivery phases and the code it is based on.
