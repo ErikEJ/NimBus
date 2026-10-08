@@ -20,7 +20,7 @@ NimBus is MIT-licensed. By submitting a contribution you agree to license it und
 
 ## Development setup
 
-Requirements: **.NET 10 SDK** and **Node.js 22** (for the WebApp client).
+Requirements: **.NET 10 SDK**, **Azure Functions Core Tools** and **Node.js 22** (for the WebApp client).
 
 ```bash
 # From the repository root: build the whole solution
